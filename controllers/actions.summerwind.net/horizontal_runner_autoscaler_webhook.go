@@ -30,7 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/go-logr/logr"
-	gogithub "github.com/google/go-github/v47/github"
+	gogithub "github.com/google/go-github/v52/github"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -115,7 +115,7 @@ func (autoscaler *HorizontalRunnerAutoscalerGitHubWebhook) Handle(w http.Respons
 	}()
 
 	// respond ok to GET / e.g. for health check
-	if r.Method == http.MethodGet {
+	if strings.ToUpper(r.Method) == http.MethodGet {
 		ok = true
 		fmt.Fprintln(w, "webhook server is running")
 		return

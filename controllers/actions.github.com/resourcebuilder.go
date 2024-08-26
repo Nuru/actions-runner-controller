@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net"
 	"strconv"
 
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
 	"github.com/actions/actions-runner-controller/build"
 	"github.com/actions/actions-runner-controller/github/actions"
 	"github.com/actions/actions-runner-controller/hash"
+	"github.com/actions/actions-runner-controller/logging"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,19 +33,54 @@ var commonLabelKeys = [...]string{
 	LabelKeyGitHubRepository,
 }
 
+var reservedListenerContainerEnvKeys = map[string]struct{}{
+	"GITHUB_CONFIGURE_URL":                  {},
+	"GITHUB_EPHEMERAL_RUNNER_SET_NAMESPACE": {},
+	"GITHUB_EPHEMERAL_RUNNER_SET_NAME":      {},
+	"GITHUB_MAX_RUNNERS":                    {},
+	"GITHUB_MIN_RUNNERS":                    {},
+	"GITHUB_RUNNER_SCALE_SET_ID":            {},
+	"GITHUB_RUNNER_LOG_LEVEL":               {},
+	"GITHUB_RUNNER_LOG_FORMAT":              {},
+	"GITHUB_TOKEN":                          {},
+	"GITHUB_APP_ID":                         {},
+	"GITHUB_APP_INSTALLATION_ID":            {},
+	"GITHUB_APP_PRIVATE_KEY":                {},
+}
+
 const labelValueKubernetesPartOf = "gha-runner-scale-set"
 
-// scaleSetListenerImagePullPolicy is applied to all listeners
+var scaleSetListenerLogLevel = DefaultScaleSetListenerLogLevel
+var scaleSetListenerLogFormat = DefaultScaleSetListenerLogFormat
+
 var scaleSetListenerImagePullPolicy = DefaultScaleSetListenerImagePullPolicy
 
 func SetListenerImagePullPolicy(pullPolicy string) bool {
 	switch p := corev1.PullPolicy(pullPolicy); p {
-	case corev1.PullAlways, corev1.PullNever, corev1.PullIfNotPresent:
+	case corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever:
 		scaleSetListenerImagePullPolicy = p
 		return true
 	default:
 		return false
 	}
+}
+
+func SetListenerLoggingParameters(level string, format string) bool {
+	switch level {
+	case logging.LogLevelDebug, logging.LogLevelInfo, logging.LogLevelWarn, logging.LogLevelError:
+	default:
+		return false
+	}
+
+	switch format {
+	case logging.LogFormatJSON, logging.LogFormatText:
+	default:
+		return false
+	}
+
+	scaleSetListenerLogLevel = level
+	scaleSetListenerLogFormat = format
+	return true
 }
 
 type resourceBuilder struct{}
@@ -63,26 +100,24 @@ func (b *resourceBuilder) newAutoScalingListener(autoscalingRunnerSet *v1alpha1.
 		effectiveMinRunners = *autoscalingRunnerSet.Spec.MinRunners
 	}
 
-	githubConfig, err := actions.ParseGitHubConfigFromURL(autoscalingRunnerSet.Spec.GitHubConfigUrl)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse github config from url: %v", err)
+	labels := map[string]string{
+		LabelKeyGitHubScaleSetNamespace: autoscalingRunnerSet.Namespace,
+		LabelKeyGitHubScaleSetName:      autoscalingRunnerSet.Name,
+		LabelKeyKubernetesPartOf:        labelValueKubernetesPartOf,
+		LabelKeyKubernetesComponent:     "runner-scale-set-listener",
+		LabelKeyKubernetesVersion:       autoscalingRunnerSet.Labels[LabelKeyKubernetesVersion],
+		labelKeyRunnerSpecHash:          autoscalingRunnerSet.ListenerSpecHash(),
+	}
+
+	if err := applyGitHubURLLabels(autoscalingRunnerSet.Spec.GitHubConfigUrl, labels); err != nil {
+		return nil, fmt.Errorf("failed to apply GitHub URL labels: %v", err)
 	}
 
 	autoscalingListener := &v1alpha1.AutoscalingListener{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      scaleSetListenerName(autoscalingRunnerSet),
 			Namespace: namespace,
-			Labels: map[string]string{
-				LabelKeyGitHubScaleSetNamespace: autoscalingRunnerSet.Namespace,
-				LabelKeyGitHubScaleSetName:      autoscalingRunnerSet.Name,
-				LabelKeyKubernetesPartOf:        labelValueKubernetesPartOf,
-				LabelKeyKubernetesComponent:     "runner-scale-set-listener",
-				LabelKeyKubernetesVersion:       autoscalingRunnerSet.Labels[LabelKeyKubernetesVersion],
-				LabelKeyGitHubEnterprise:        githubConfig.Enterprise,
-				LabelKeyGitHubOrganization:      githubConfig.Organization,
-				LabelKeyGitHubRepository:        githubConfig.Repository,
-				labelKeyRunnerSpecHash:          autoscalingRunnerSet.ListenerSpecHash(),
-			},
+			Labels:    labels,
 		},
 		Spec: v1alpha1.AutoscalingListenerSpec{
 			GitHubConfigUrl:               autoscalingRunnerSet.Spec.GitHubConfigUrl,
@@ -94,17 +129,22 @@ func (b *resourceBuilder) newAutoScalingListener(autoscalingRunnerSet *v1alpha1.
 			MinRunners:                    effectiveMinRunners,
 			MaxRunners:                    effectiveMaxRunners,
 			Image:                         image,
-			ImagePullPolicy:               scaleSetListenerImagePullPolicy,
 			ImagePullSecrets:              imagePullSecrets,
 			Proxy:                         autoscalingRunnerSet.Spec.Proxy,
 			GitHubServerTLS:               autoscalingRunnerSet.Spec.GitHubServerTLS,
+			Template:                      autoscalingRunnerSet.Spec.ListenerTemplate,
 		},
 	}
 
 	return autoscalingListener, nil
 }
 
-func (b *resourceBuilder) newScaleSetListenerPod(autoscalingListener *v1alpha1.AutoscalingListener, serviceAccount *corev1.ServiceAccount, secret *corev1.Secret, envs ...corev1.EnvVar) *corev1.Pod {
+type listenerMetricsServerConfig struct {
+	addr     string
+	endpoint string
+}
+
+func (b *resourceBuilder) newScaleSetListenerPod(autoscalingListener *v1alpha1.AutoscalingListener, serviceAccount *corev1.ServiceAccount, secret *corev1.Secret, metricsConfig *listenerMetricsServerConfig, envs ...corev1.EnvVar) (*corev1.Pod, error) {
 	listenerEnv := []corev1.EnvVar{
 		{
 			Name:  "GITHUB_CONFIGURE_URL",
@@ -129,6 +169,18 @@ func (b *resourceBuilder) newScaleSetListenerPod(autoscalingListener *v1alpha1.A
 		{
 			Name:  "GITHUB_RUNNER_SCALE_SET_ID",
 			Value: strconv.Itoa(autoscalingListener.Spec.RunnerScaleSetId),
+		},
+		{
+			Name:  "GITHUB_RUNNER_SCALE_SET_NAME",
+			Value: autoscalingListener.Spec.AutoscalingRunnerSetName,
+		},
+		{
+			Name:  "GITHUB_RUNNER_LOG_LEVEL",
+			Value: scaleSetListenerLogLevel,
+		},
+		{
+			Name:  "GITHUB_RUNNER_LOG_FORMAT",
+			Value: scaleSetListenerLogFormat,
 		},
 	}
 	listenerEnv = append(listenerEnv, envs...)
@@ -189,6 +241,38 @@ func (b *resourceBuilder) newScaleSetListenerPod(autoscalingListener *v1alpha1.A
 		})
 	}
 
+	var ports []corev1.ContainerPort
+	if metricsConfig != nil && len(metricsConfig.addr) != 0 {
+		listenerEnv = append(
+			listenerEnv,
+			corev1.EnvVar{
+				Name:  "GITHUB_METRICS_ADDR",
+				Value: metricsConfig.addr,
+			},
+			corev1.EnvVar{
+				Name:  "GITHUB_METRICS_ENDPOINT",
+				Value: metricsConfig.endpoint,
+			},
+		)
+
+		_, portStr, err := net.SplitHostPort(metricsConfig.addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to split host:port for metrics address: %v", err)
+		}
+		port, err := strconv.ParseInt(portStr, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert port %q to int32: %v", portStr, err)
+		}
+		ports = append(
+			ports,
+			corev1.ContainerPort{
+				ContainerPort: int32(port),
+				Protocol:      corev1.ProtocolTCP,
+				Name:          "metrics",
+			},
+		)
+	}
+
 	podSpec := corev1.PodSpec{
 		ServiceAccountName: serviceAccount.Name,
 		Containers: []corev1.Container{
@@ -196,10 +280,11 @@ func (b *resourceBuilder) newScaleSetListenerPod(autoscalingListener *v1alpha1.A
 				Name:            autoscalingListenerContainerName,
 				Image:           autoscalingListener.Spec.Image,
 				Env:             listenerEnv,
-				ImagePullPolicy: autoscalingListener.Spec.ImagePullPolicy,
+				ImagePullPolicy: scaleSetListenerImagePullPolicy,
 				Command: []string{
 					"/github-runnerscaleset-listener",
 				},
+				Ports: ports,
 			},
 		},
 		ImagePullSecrets: autoscalingListener.Spec.ImagePullSecrets,
@@ -224,7 +309,130 @@ func (b *resourceBuilder) newScaleSetListenerPod(autoscalingListener *v1alpha1.A
 		Spec: podSpec,
 	}
 
-	return newRunnerScaleSetListenerPod
+	if autoscalingListener.Spec.Template != nil {
+		mergeListenerPodWithTemplate(newRunnerScaleSetListenerPod, autoscalingListener.Spec.Template)
+	}
+
+	return newRunnerScaleSetListenerPod, nil
+}
+
+func mergeListenerPodWithTemplate(pod *corev1.Pod, tmpl *corev1.PodTemplateSpec) {
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	for k, v := range tmpl.Annotations {
+		if _, ok := pod.Annotations[k]; !ok {
+			pod.Annotations[k] = v
+		}
+	}
+
+	for k, v := range tmpl.Labels {
+		if _, ok := pod.Labels[k]; !ok {
+			pod.Labels[k] = v
+		}
+	}
+
+	// apply spec
+
+	// apply container
+	listenerContainer := &pod.Spec.Containers[0] // if this panics, we have bigger problems
+	for i := range tmpl.Spec.Containers {
+		c := &tmpl.Spec.Containers[i]
+
+		switch c.Name {
+		case "listener":
+			mergeListenerContainer(listenerContainer, c)
+		default:
+			pod.Spec.Containers = append(pod.Spec.Containers, *c)
+		}
+	}
+
+	// apply pod related spec
+	// NOTE: fields that should be gnored
+	// - service account based fields
+
+	if tmpl.Spec.RestartPolicy != "" {
+		pod.Spec.RestartPolicy = tmpl.Spec.RestartPolicy
+	}
+
+	if tmpl.Spec.ImagePullSecrets != nil {
+		pod.Spec.ImagePullSecrets = tmpl.Spec.ImagePullSecrets
+	}
+
+	pod.Spec.Volumes = tmpl.Spec.Volumes
+	pod.Spec.InitContainers = tmpl.Spec.InitContainers
+	pod.Spec.EphemeralContainers = tmpl.Spec.EphemeralContainers
+	pod.Spec.TerminationGracePeriodSeconds = tmpl.Spec.TerminationGracePeriodSeconds
+	pod.Spec.ActiveDeadlineSeconds = tmpl.Spec.ActiveDeadlineSeconds
+	pod.Spec.DNSPolicy = tmpl.Spec.DNSPolicy
+	pod.Spec.NodeSelector = tmpl.Spec.NodeSelector
+	pod.Spec.NodeName = tmpl.Spec.NodeName
+	pod.Spec.HostNetwork = tmpl.Spec.HostNetwork
+	pod.Spec.HostPID = tmpl.Spec.HostPID
+	pod.Spec.HostIPC = tmpl.Spec.HostIPC
+	pod.Spec.ShareProcessNamespace = tmpl.Spec.ShareProcessNamespace
+	pod.Spec.SecurityContext = tmpl.Spec.SecurityContext
+	pod.Spec.Hostname = tmpl.Spec.Hostname
+	pod.Spec.Subdomain = tmpl.Spec.Subdomain
+	pod.Spec.Affinity = tmpl.Spec.Affinity
+	pod.Spec.SchedulerName = tmpl.Spec.SchedulerName
+	pod.Spec.Tolerations = tmpl.Spec.Tolerations
+	pod.Spec.HostAliases = tmpl.Spec.HostAliases
+	pod.Spec.PriorityClassName = tmpl.Spec.PriorityClassName
+	pod.Spec.Priority = tmpl.Spec.Priority
+	pod.Spec.DNSConfig = tmpl.Spec.DNSConfig
+	pod.Spec.ReadinessGates = tmpl.Spec.ReadinessGates
+	pod.Spec.RuntimeClassName = tmpl.Spec.RuntimeClassName
+	pod.Spec.EnableServiceLinks = tmpl.Spec.EnableServiceLinks
+	pod.Spec.PreemptionPolicy = tmpl.Spec.PreemptionPolicy
+	pod.Spec.Overhead = tmpl.Spec.Overhead
+	pod.Spec.TopologySpreadConstraints = tmpl.Spec.TopologySpreadConstraints
+	pod.Spec.SetHostnameAsFQDN = tmpl.Spec.SetHostnameAsFQDN
+	pod.Spec.OS = tmpl.Spec.OS
+	pod.Spec.HostUsers = tmpl.Spec.HostUsers
+	pod.Spec.SchedulingGates = tmpl.Spec.SchedulingGates
+	pod.Spec.ResourceClaims = tmpl.Spec.ResourceClaims
+}
+
+func mergeListenerContainer(base, from *corev1.Container) {
+	// name should not be modified
+
+	if from.Image != "" {
+		base.Image = from.Image
+	}
+
+	if len(from.Command) > 0 {
+		base.Command = from.Command
+	}
+
+	for _, v := range from.Env {
+		if _, ok := reservedListenerContainerEnvKeys[v.Name]; !ok {
+			base.Env = append(base.Env, v)
+		}
+	}
+
+	if from.ImagePullPolicy != "" {
+		base.ImagePullPolicy = from.ImagePullPolicy
+	}
+
+	base.Args = append(base.Args, from.Args...)
+	base.WorkingDir = from.WorkingDir
+	base.Ports = append(base.Ports, from.Ports...)
+	base.EnvFrom = append(base.EnvFrom, from.EnvFrom...)
+	base.Resources = from.Resources
+	base.VolumeMounts = append(base.VolumeMounts, from.VolumeMounts...)
+	base.VolumeDevices = append(base.VolumeDevices, from.VolumeDevices...)
+	base.LivenessProbe = from.LivenessProbe
+	base.ReadinessProbe = from.ReadinessProbe
+	base.StartupProbe = from.StartupProbe
+	base.Lifecycle = from.Lifecycle
+	base.TerminationMessagePath = from.TerminationMessagePath
+	base.TerminationMessagePolicy = from.TerminationMessagePolicy
+	base.ImagePullPolicy = from.ImagePullPolicy
+	base.SecurityContext = from.SecurityContext
+	base.Stdin = from.Stdin
+	base.StdinOnce = from.StdinOnce
+	base.TTY = from.TTY
 }
 
 func (b *resourceBuilder) newScaleSetListenerServiceAccount(autoscalingListener *v1alpha1.AutoscalingListener) *corev1.ServiceAccount {
@@ -323,7 +531,7 @@ func (b *resourceBuilder) newEphemeralRunnerSet(autoscalingRunnerSet *v1alpha1.A
 	}
 	runnerSpecHash := autoscalingRunnerSet.RunnerSetSpecHash()
 
-	newLabels := map[string]string{
+	labels := map[string]string{
 		labelKeyRunnerSpecHash:          runnerSpecHash,
 		LabelKeyKubernetesPartOf:        labelValueKubernetesPartOf,
 		LabelKeyKubernetesComponent:     "runner-set",
@@ -332,7 +540,7 @@ func (b *resourceBuilder) newEphemeralRunnerSet(autoscalingRunnerSet *v1alpha1.A
 		LabelKeyGitHubScaleSetNamespace: autoscalingRunnerSet.Namespace,
 	}
 
-	if err := applyGitHubURLLabels(autoscalingRunnerSet.Spec.GitHubConfigUrl, newLabels); err != nil {
+	if err := applyGitHubURLLabels(autoscalingRunnerSet.Spec.GitHubConfigUrl, labels); err != nil {
 		return nil, fmt.Errorf("failed to apply GitHub URL labels: %v", err)
 	}
 
@@ -345,7 +553,7 @@ func (b *resourceBuilder) newEphemeralRunnerSet(autoscalingRunnerSet *v1alpha1.A
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: autoscalingRunnerSet.ObjectMeta.Name + "-",
 			Namespace:    autoscalingRunnerSet.ObjectMeta.Namespace,
-			Labels:       newLabels,
+			Labels:       labels,
 			Annotations:  newAnnotations,
 		},
 		Spec: v1alpha1.EphemeralRunnerSetSpec{
@@ -545,14 +753,23 @@ func applyGitHubURLLabels(url string, labels map[string]string) error {
 	}
 
 	if len(githubConfig.Enterprise) > 0 {
-		labels[LabelKeyGitHubEnterprise] = githubConfig.Enterprise
+		labels[LabelKeyGitHubEnterprise] = trimLabelValue(githubConfig.Enterprise)
 	}
 	if len(githubConfig.Organization) > 0 {
-		labels[LabelKeyGitHubOrganization] = githubConfig.Organization
+		labels[LabelKeyGitHubOrganization] = trimLabelValue(githubConfig.Organization)
 	}
 	if len(githubConfig.Repository) > 0 {
-		labels[LabelKeyGitHubRepository] = githubConfig.Repository
+		labels[LabelKeyGitHubRepository] = trimLabelValue(githubConfig.Repository)
 	}
 
 	return nil
+}
+
+const trimLabelVauleSuffix = "-trim"
+
+func trimLabelValue(val string) string {
+	if len(val) > 63 {
+		return val[:63-len(trimLabelVauleSuffix)] + trimLabelVauleSuffix
+	}
+	return val
 }
