@@ -114,7 +114,14 @@ func createSession(ctx context.Context, logger *logr.Logger, client actions.Acti
 		return runnerScaleSetSession, initialMessage, nil
 	}
 
-	return runnerScaleSetSession, nil, nil
+	initialMessage := &actions.RunnerScaleSetMessage{
+		MessageId:   0,
+		MessageType: "RunnerScaleSetJobMessages",
+		Statistics:  runnerScaleSetSession.Statistics,
+		Body:        "",
+	}
+
+	return runnerScaleSetSession, initialMessage, nil
 }
 
 func (m *AutoScalerClient) Close() error {
@@ -122,7 +129,7 @@ func (m *AutoScalerClient) Close() error {
 	return m.client.Close()
 }
 
-func (m *AutoScalerClient) GetRunnerScaleSetMessage(ctx context.Context, handler func(msg *actions.RunnerScaleSetMessage) error) error {
+func (m *AutoScalerClient) GetRunnerScaleSetMessage(ctx context.Context, handler func(msg *actions.RunnerScaleSetMessage) error, maxCapacity int) error {
 	if m.initialMessage != nil {
 		err := handler(m.initialMessage)
 		if err != nil {
@@ -134,7 +141,7 @@ func (m *AutoScalerClient) GetRunnerScaleSetMessage(ctx context.Context, handler
 	}
 
 	for {
-		message, err := m.client.GetMessage(ctx, m.lastMessageId)
+		message, err := m.client.GetMessage(ctx, m.lastMessageId, maxCapacity)
 		if err != nil {
 			return fmt.Errorf("get message failed from refreshing client. %w", err)
 		}

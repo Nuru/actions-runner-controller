@@ -135,7 +135,7 @@ var _ = Describe("EphemeralRunner", func() {
 				},
 				timeout,
 				interval,
-			).Should(BeEquivalentTo([]string{ephemeralRunnerActionsFinalizerName, ephemeralRunnerFinalizerName}))
+			).Should(BeEquivalentTo([]string{ephemeralRunnerFinalizerName, ephemeralRunnerActionsFinalizerName}))
 
 			Eventually(
 				func() (bool, error) {
@@ -187,6 +187,25 @@ var _ = Describe("EphemeralRunner", func() {
 				timeout,
 				interval,
 			).Should(BeEquivalentTo(true))
+		})
+
+		It("It should failed if a pod template is invalid", func() {
+			invalideEphemeralRunner := newExampleRunner("invalid-ephemeral-runner", autoscalingNS.Name, configSecret.Name)
+			invalideEphemeralRunner.Spec.Spec.PriorityClassName = "notexist"
+
+			err := k8sClient.Create(ctx, invalideEphemeralRunner)
+			Expect(err).To(BeNil())
+
+			updated := new(v1alpha1.EphemeralRunner)
+			Eventually(func() (corev1.PodPhase, error) {
+				err := k8sClient.Get(ctx, client.ObjectKey{Name: invalideEphemeralRunner.Name, Namespace: invalideEphemeralRunner.Namespace}, updated)
+				if err != nil {
+					return "", nil
+				}
+				return updated.Status.Phase, nil
+			}, timeout, interval).Should(BeEquivalentTo(corev1.PodFailed))
+			Expect(updated.Status.Reason).Should(Equal("InvalidPod"))
+			Expect(updated.Status.Message).Should(Equal("Failed to create the pod: pods \"invalid-ephemeral-runner\" is forbidden: no PriorityClass with name notexist was found"))
 		})
 
 		It("It should clean up resources when deleted", func() {
@@ -652,8 +671,10 @@ var _ = Describe("EphemeralRunner", func() {
 							fake.WithGetRunner(
 								nil,
 								&actions.ActionsError{
-									StatusCode:    http.StatusNotFound,
-									ExceptionName: "AgentNotFoundException",
+									StatusCode: http.StatusNotFound,
+									Err: &actions.ActionsExceptionError{
+										ExceptionName: "AgentNotFoundException",
+									},
 								},
 							),
 						),
@@ -729,7 +750,7 @@ var _ = Describe("EphemeralRunner", func() {
 
 		It("uses an actions client with proxy transport", func() {
 			// Use an actual client
-			controller.ActionsClient = actions.NewMultiClient("test", logr.Discard())
+			controller.ActionsClient = actions.NewMultiClient(logr.Discard())
 
 			proxySuccessfulllyCalled := false
 			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -914,7 +935,7 @@ var _ = Describe("EphemeralRunner", func() {
 			server.StartTLS()
 
 			// Use an actual client
-			controller.ActionsClient = actions.NewMultiClient("test", logr.Discard())
+			controller.ActionsClient = actions.NewMultiClient(logr.Discard())
 
 			ephemeralRunner := newExampleRunner("test-runner", autoScalingNS.Name, configSecret.Name)
 			ephemeralRunner.Spec.GitHubConfigUrl = server.ConfigURLForOrg("my-org")

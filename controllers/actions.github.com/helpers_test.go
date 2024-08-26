@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
@@ -17,6 +18,9 @@ const defaultGitHubToken = "gh_token"
 
 func startManagers(t ginkgo.GinkgoTInterface, first manager.Manager, others ...manager.Manager) {
 	for _, mgr := range append([]manager.Manager{first}, others...) {
+		if err := SetupIndexers(mgr); err != nil {
+			t.Fatalf("failed to setup indexers: %v", err)
+		}
 		ctx, cancel := context.WithCancel(context.Background())
 
 		g, ctx := errgroup.WithContext(ctx)
@@ -45,8 +49,11 @@ func createNamespace(t ginkgo.GinkgoTInterface, client client.Client) (*corev1.N
 	})
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Namespace:          ns.Name,
-		MetricsBindAddress: "0",
+		Cache: cache.Options{
+			DefaultNamespaces: map[string]cache.Config{
+				ns.Name: {},
+			},
+		},
 	})
 	require.NoError(t, err)
 

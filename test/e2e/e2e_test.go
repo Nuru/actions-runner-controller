@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/actions/actions-runner-controller/testing"
-	"github.com/google/go-github/v47/github"
+	"github.com/google/go-github/v52/github"
 	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
@@ -36,7 +36,8 @@ var (
 
 	testResultCMNamePrefix = "test-result-"
 
-	RunnerVersion = "2.303.0"
+	RunnerVersion               = "2.317.0"
+	RunnerContainerHooksVersion = "0.6.1"
 )
 
 // If you're willing to run this test via VS Code "run test" or "debug test",
@@ -92,7 +93,7 @@ func TestE2E(t *testing.T) {
 		os.Getenv("UBUNTU_VERSION"),
 	)
 
-	var testedVersions = []struct {
+	testedVersions := []struct {
 		label                     string
 		controller, controllerVer string
 		chart, chartVer           string
@@ -153,9 +154,7 @@ func TestE2E(t *testing.T) {
 			t.Skip("RunnerSets test has been skipped due to ARC_E2E_SKIP_RUNNERSETS")
 		}
 
-		var (
-			testID string
-		)
+		var testID string
 
 		t.Run("get or generate test ID", func(t *testing.T) {
 			testID = env.GetOrGenerateTestID(t)
@@ -267,9 +266,7 @@ func TestE2E(t *testing.T) {
 			t.Skip("RunnerSets test has been skipped due to ARC_E2E_SKIP_RUNNERSETS")
 		}
 
-		var (
-			testID string
-		)
+		var testID string
 
 		t.Run("get or generate test ID", func(t *testing.T) {
 			testID = env.GetOrGenerateTestID(t)
@@ -458,7 +455,7 @@ func buildVars(repo, ubuntuVer string) vars {
 		runnerRootlessDindImage     = testing.Img(runnerRootlessDindImageRepo, runnerImageTag)
 
 		dindSidecarImageRepo = "docker"
-		dindSidecarImageTag  = "20.10.23-dind"
+		dindSidecarImageTag  = "24.0.7-dind"
 		dindSidecarImage     = testing.Img(dindSidecarImageRepo, dindSidecarImageTag)
 	)
 
@@ -496,6 +493,10 @@ func buildVars(repo, ubuntuVer string) vars {
 					Name:  "RUNNER_VERSION",
 					Value: RunnerVersion,
 				},
+				{
+					Name:  "RUNNER_CONTAINER_HOOKS_VERSION",
+					Value: RunnerContainerHooksVersion,
+				},
 			},
 			Image:        runnerImage,
 			EnableBuildX: true,
@@ -507,6 +508,10 @@ func buildVars(repo, ubuntuVer string) vars {
 					Name:  "RUNNER_VERSION",
 					Value: RunnerVersion,
 				},
+				{
+					Name:  "RUNNER_CONTAINER_HOOKS_VERSION",
+					Value: RunnerContainerHooksVersion,
+				},
 			},
 			Image:        runnerDindImage,
 			EnableBuildX: true,
@@ -517,6 +522,10 @@ func buildVars(repo, ubuntuVer string) vars {
 				{
 					Name:  "RUNNER_VERSION",
 					Value: RunnerVersion,
+				},
+				{
+					Name:  "RUNNER_CONTAINER_HOOKS_VERSION",
+					Value: RunnerContainerHooksVersion,
 				},
 			},
 			Image:        runnerRootlessDindImage,
@@ -1097,7 +1106,7 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 				testing.Step{
 					Uses: "actions/setup-go@v3",
 					With: &testing.With{
-						GoVersion: "1.18.2",
+						GoVersion: "1.22.4",
 					},
 				},
 			)
@@ -1227,7 +1236,7 @@ func installActionsWorkflow(t *testing.T, testName, runnerLabel, testResultCMNam
 			testing.Step{
 				Uses: "azure/setup-kubectl@v1",
 				With: &testing.With{
-					Version: "v1.20.2",
+					Version: "v1.22.4",
 				},
 			},
 			testing.Step{
